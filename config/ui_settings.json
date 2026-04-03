@@ -1,0 +1,15 @@
+{
+  "ui_mode": "advanced",
+  "visible_profiles": [
+    "code_generate",
+    "code_debug",
+    "code_refactor",
+    "erkl_re"
+  ],
+  "show_project_structure": true,
+  "show_active_prompt_files": true,
+  "show_active_run": true,
+  "show_result_prompts": true,
+  "show_files_tab": true,
+  "show_scripts_tab": true
+}
