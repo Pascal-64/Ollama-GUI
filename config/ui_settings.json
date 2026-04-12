@@ -7,7 +7,7 @@
     "erkl_re"
   ],
   "show_project_structure": true,
-  "show_active_prompt_files": true,
+  "show_active_prompt_files": false,
   "show_active_run": true,
   "show_result_prompts": true,
   "show_files_tab": true,

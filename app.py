@@ -261,6 +261,47 @@ Input:
 """
 
 
+AUTO_REVIEW_PROMPT = """Du bist ein strenger technischer Reviewer.
+
+Deine Aufgabe:
+Prüfe, ob die finale Antwort die ursprüngliche Aufgabe erfüllt.
+
+Regeln:
+- Bewerte nur anhand der bereitgestellten Informationen.
+- Sei streng, aber fair.
+- Wenn wesentliche Anforderungen fehlen, setze FAIL.
+- Wenn nur kleine Verbesserungen sinnvoll wären, aber die Aufgabe im Kern erfüllt ist, darfst du PASS setzen und die Hinweise trotzdem nennen.
+- Gib exakt dieses Format zurück und nichts anderes:
+
+REVIEW_STATUS: PASS oder FAIL
+REVIEW_SUMMARY: <eine kurze technische Zusammenfassung>
+REVIEW_ISSUES:
+- <Punkt 1>
+- <Punkt 2 oder 'Keine wesentlichen Probleme'>
+IMPROVEMENT_TASK: <kurze konkrete Anweisung zur Verbesserung oder NONE>
+
+Eingabe:
+[REVIEW_INPUT]
+"""
+
+AUTO_IMPROVE_PROMPT = """Du bist ein technischer Entwickler.
+
+Deine Aufgabe:
+Verbessere die finale Antwort anhand der Review-Ergebnisse.
+
+Regeln:
+- Nutze die ursprüngliche Aufgabe, die bisherige finale Antwort und die Review-Hinweise.
+- Behebe nur die erkannten Probleme und verschlechtere nichts, was bereits funktioniert.
+- Gib nur die verbesserte finale Antwort zurück.
+- Keine Einleitung.
+- Keine Erklärung.
+- Keine Markdown-Codeblöcke.
+
+Eingabe:
+[IMPROVE_INPUT]
+"""
+
+
 class PipelineError(Exception):
     pass
 
@@ -705,6 +746,247 @@ def open_folder_in_explorer(path: Path) -> None:
     subprocess.Popen(["xdg-open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def command_exists(command_name: str) -> bool:
+    return shutil.which(command_name) is not None
+
+
+def open_in_vscode(path: Path) -> None:
+    vscode_cmd = shutil.which("code") or shutil.which("code.cmd") or shutil.which("code.exe")
+    if not vscode_cmd:
+        raise PipelineError("VS Code CLI 'code' wurde nicht gefunden. Installiere die Shell-Command-Integration von VS Code.")
+    subprocess.Popen([vscode_cmd, str(path.resolve())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def get_codex_command() -> str | None:
+    return shutil.which("codex") or shutil.which("codex.cmd") or shutil.which("codex.exe")
+
+
+def codex_available() -> bool:
+    return get_codex_command() is not None
+
+
+def build_codex_exec_prompt(run_meta: dict) -> str:
+    return (
+        "Lies zuerst die Datei CODEX_HANDOFF.md im Root des aktuellen Worktrees und folge ihr vollständig. "
+        "Arbeite nur im aktuellen Worktree. Prüfe task.md, review.md, result.json und vorhandene Outputs. "
+        "Setze notwendige Änderungen direkt im Codebestand um, aktualisiere die betroffenen Run-Dateien im Worktree, "
+        "und gib am Ende eine kurze Zusammenfassung der Änderungen zurück."
+    )
+
+
+def run_codex_exec(worktree_path: Path, prompt: str) -> subprocess.CompletedProcess[str]:
+    codex_cmd = get_codex_command()
+    if not codex_cmd:
+        raise PipelineError("Codex CLI wurde nicht gefunden. Installiere Codex CLI und melde dich an.")
+    if not worktree_path.exists() or not worktree_path.is_dir():
+        raise PipelineError(f"Worktree nicht gefunden: {worktree_path}")
+
+    cmd = [
+        codex_cmd,
+        "exec",
+        "--full-auto",
+        "--sandbox",
+        "workspace-write",
+        prompt,
+    ]
+    return subprocess.run(
+        cmd,
+        cwd=str(worktree_path),
+        capture_output=True,
+        text=True,
+        timeout=3600,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def write_codex_exec_artifacts(run_id: str, exec_prompt: str, process: subprocess.CompletedProcess[str]) -> dict:
+    run_meta = get_worktree_run(run_id)
+    if not run_meta:
+        raise PipelineError(f"Run nicht gefunden: {run_id}")
+
+    meta_dir = Path(str(run_meta.get("meta_path", RUNS_ROOT / run_id)))
+    worktree_dir = Path(str(run_meta.get("worktree_path", WORKTREES_ROOT / run_id)))
+    executed_at = datetime.now().isoformat(timespec="seconds")
+
+    result_payload = {
+        "run_id": run_id,
+        "executed_at": executed_at,
+        "command": process.args,
+        "returncode": process.returncode,
+        "prompt": exec_prompt,
+        "stdout": process.stdout or "",
+        "stderr": process.stderr or "",
+        "worktree_path": str(worktree_dir),
+    }
+
+    result_json_path = meta_dir / "codex_exec_result.json"
+    stdout_path = meta_dir / "codex_exec_stdout.md"
+    stderr_path = meta_dir / "codex_exec_stderr.log"
+    worktree_result_json_path = worktree_dir / "CODEX_EXEC_RESULT.json"
+    worktree_stdout_path = worktree_dir / "CODEX_EXEC_LAST_MESSAGE.md"
+    worktree_stderr_path = worktree_dir / "CODEX_EXEC_STDERR.log"
+
+    write_text_file(result_json_path, json.dumps(result_payload, ensure_ascii=False, indent=2))
+    write_text_file(stdout_path, process.stdout or "")
+    write_text_file(stderr_path, process.stderr or "")
+    if worktree_dir.exists() and worktree_dir.is_dir():
+        write_text_file(worktree_result_json_path, json.dumps(result_payload, ensure_ascii=False, indent=2))
+        write_text_file(worktree_stdout_path, process.stdout or "")
+        write_text_file(worktree_stderr_path, process.stderr or "")
+
+    updated_meta = update_worktree_run_meta(
+        run_id,
+        {
+            "last_codex_exec_at": executed_at,
+            "last_codex_exec_status": "success" if process.returncode == 0 else "failed",
+            "last_codex_exec_result_path": str(result_json_path),
+            "last_codex_exec_stdout_path": str(stdout_path),
+            "last_codex_exec_stderr_path": str(stderr_path),
+            "last_codex_exec_worktree_result_path": str(worktree_result_json_path),
+        },
+    )
+
+    return {
+        "run_id": run_id,
+        "executed_at": executed_at,
+        "returncode": process.returncode,
+        "prompt": exec_prompt,
+        "stdout": process.stdout or "",
+        "stderr": process.stderr or "",
+        "result_path": str(result_json_path),
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "worktree_result_path": str(worktree_result_json_path),
+        "worktree_stdout_path": str(worktree_stdout_path),
+        "worktree_stderr_path": str(worktree_stderr_path),
+        "meta": updated_meta,
+    }
+
+
+def execute_codex_for_run(run_id: str) -> dict:
+    run_meta = get_worktree_run(run_id)
+    if not run_meta:
+        raise PipelineError(f"Run nicht gefunden: {run_id}")
+
+    worktree_path = Path(str(run_meta.get("worktree_path", "")))
+    handoff_path = Path(str(run_meta.get("last_handoff_worktree_path") or (worktree_path / "CODEX_HANDOFF.md")))
+    if not handoff_path.exists() or not handoff_path.is_file():
+        raise PipelineError("Keine CODEX_HANDOFF.md im aktiven Worktree gefunden. Führe zuerst einen Lauf mit Handoff aus.")
+
+    exec_prompt = build_codex_exec_prompt(run_meta)
+    process = run_codex_exec(worktree_path, exec_prompt)
+    exec_data = write_codex_exec_artifacts(run_id, exec_prompt, process)
+    exec_data["handoff_path"] = str(handoff_path)
+    exec_data["worktree_path"] = str(worktree_path)
+    return exec_data
+
+
+def build_codex_handoff_markdown(run_meta: dict, user_input: str, result: dict, output_path: Path | None = None) -> str:
+    automation = result.get("automation", {})
+    final_review = automation.get("final_review") or automation.get("initial_review") or {}
+    issues = final_review.get("issues", [])
+    lines = [
+        f"# Codex Handoff – Run {run_meta.get('run_id', '-')}",
+        "",
+        "## Ziel",
+        "",
+        "Übernimm diesen Run im Worktree, prüfe das aktuelle Ergebnis und verbessere es bei Bedarf direkt im Codebestand.",
+        "",
+        "## Eingabe",
+        "",
+        user_input.strip() or "-",
+        "",
+        "## Laufkontext",
+        "",
+        f"- Profil: {result.get('profile_label', result.get('profile_key', '-'))}",
+        f"- Modus: {result.get('mode_name', '-')}",
+        f"- Modell: {result.get('model', '-')}",
+        f"- Worktree: {run_meta.get('worktree_path', '-')}",
+        f"- task.md im Worktree: {run_meta.get('worktree_task_path', Path(str(run_meta.get('worktree_path', '-'))) / 'task.md' if run_meta.get('worktree_path') else '-')}",
+        f"- review.md im Worktree: {run_meta.get('worktree_review_path', Path(str(run_meta.get('worktree_path', '-'))) / 'review.md' if run_meta.get('worktree_path') else '-')}",
+        f"- result.json im Worktree: {run_meta.get('worktree_result_path', Path(str(run_meta.get('worktree_path', '-'))) / 'result.json' if run_meta.get('worktree_path') else '-')}",
+        f"- Run task.md: {run_meta.get('task_path', '-')}",
+        f"- Run review.md: {run_meta.get('review_path', '-')}",
+        f"- Run result.json: {run_meta.get('result_path', '-')}",
+        f"- Letzter Output: {output_path if output_path else run_meta.get('worktree_output_path') or run_meta.get('last_output_path', '-')}",
+        "",
+        "## Aktueller Review-Stand",
+        "",
+        f"- Status: {final_review.get('status', '-')}",
+        f"- Zusammenfassung: {final_review.get('summary', '-')}",
+        f"- Verbesserungsauftrag: {final_review.get('improvement_task', 'NONE')}",
+        "",
+        "## Auffälligkeiten",
+        "",
+    ]
+    if issues:
+        lines.extend([f"- {issue}" for issue in issues])
+    else:
+        lines.append("- Keine spezifischen Issues dokumentiert.")
+    lines.extend([
+        "",
+        "## Arbeitsanweisung für Codex",
+        "",
+        "1. Lies zuerst task.md, review.md und result.json.",
+        "2. Prüfe den aktuellen Output gegen Aufgabe und Review-Status.",
+        "3. Verbessere die Lösung direkt im Worktree, wenn Review oder Ergebnis das nahelegen.",
+        "4. Halte Änderungen lokal im Worktree und ändere nicht den Hauptstand außerhalb des Runs.",
+        "5. Aktualisiere am Ende die betroffenen Dateien im Worktree und hinterlasse ein sauberes Ergebnis.",
+    ])
+    return "\n".join(lines).strip() + "\n"
+
+
+def write_codex_handoff_artifacts(run_id: str, user_input: str, result: dict, run_write: dict | None = None) -> dict:
+    run_meta = get_worktree_run(run_id)
+    if not run_meta:
+        raise PipelineError(f"Run nicht gefunden: {run_id}")
+
+    meta_dir = Path(str(run_meta.get("meta_path", RUNS_ROOT / run_id)))
+    worktree_path = Path(str(run_meta.get("worktree_path", WORKTREES_ROOT / run_id)))
+    output_path = Path(str((run_write or {}).get("output_path") or run_meta.get("last_output_path") or "")) if ((run_write or {}).get("output_path") or run_meta.get("last_output_path")) else None
+
+    handoff_meta_path = meta_dir / "codex_handoff.md"
+    handoff_worktree_path = worktree_path / "CODEX_HANDOFF.md"
+    context_path = meta_dir / "codex_context.json"
+
+    handoff_content = build_codex_handoff_markdown(run_meta=run_meta, user_input=user_input, result=result, output_path=output_path)
+    write_text_file(handoff_meta_path, handoff_content)
+    if worktree_path.exists() and worktree_path.is_dir():
+        write_text_file(handoff_worktree_path, handoff_content)
+
+    context_payload = {
+        "run_id": run_id,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "profile_key": result.get("profile_key"),
+        "profile_label": result.get("profile_label"),
+        "mode_name": result.get("mode_name"),
+        "model": result.get("model"),
+        "user_input": user_input,
+        "run_meta": run_meta,
+        "run_write": run_write or {},
+        "review": result.get("automation", {}).get("final_review") or result.get("automation", {}).get("initial_review") or {},
+    }
+    write_text_file(context_path, json.dumps(context_payload, ensure_ascii=False, indent=2))
+
+    updated_meta = update_worktree_run_meta(
+        run_id,
+        {
+            "last_handoff_at": context_payload["updated_at"],
+            "last_handoff_path": str(handoff_meta_path),
+            "last_handoff_worktree_path": str(handoff_worktree_path),
+            "last_context_path": str(context_path),
+        },
+    )
+    return {
+        "handoff_path": str(handoff_meta_path),
+        "handoff_worktree_path": str(handoff_worktree_path),
+        "context_path": str(context_path),
+        "worktree_path": str(worktree_path),
+        "meta": updated_meta,
+    }
+
+
 def run_script(script_path: Path, working_dir: Path | None = None) -> subprocess.CompletedProcess[str]:
     ext = script_path.suffix.lower()
     if ext == ".ps1":
@@ -769,11 +1051,17 @@ def collect_run_stats(result: dict | None) -> dict:
     else:
         metas = [result.get("code_meta", {})]
 
+    automation = result.get("automation", {}) if isinstance(result, dict) else {}
+    for key in ("initial_review_meta", "improve_meta", "final_review_meta"):
+        value = automation.get(key)
+        if isinstance(value, dict):
+            metas.append(value)
+
     return {
         "input_tokens": sum(metric_value(meta, "prompt_eval_count") for meta in metas),
         "output_tokens": sum(metric_value(meta, "eval_count") for meta in metas),
         "total_duration": sum(metric_value(meta, "total_duration") for meta in metas),
-        "steps": len(metas),
+        "steps": len([meta for meta in metas if meta]),
     }
 
 
@@ -1012,6 +1300,9 @@ def create_worktree_run(run_name: str, base_ref: str = "main") -> dict:
     task_path = meta_dir / "task.md"
     review_path = meta_dir / "review.md"
     result_path = meta_dir / "result.json"
+    worktree_task_path = worktree_path / "task.md"
+    worktree_review_path = worktree_path / "review.md"
+    worktree_result_path = worktree_path / "result.json"
     requested_base_ref = (base_ref or "").strip() or git_default_branch(repo_root) or "HEAD"
 
     candidate_refs = build_base_ref_candidates(repo_root, requested_base_ref)
@@ -1066,6 +1357,9 @@ def create_worktree_run(run_name: str, base_ref: str = "main") -> dict:
         "task_path": str(task_path),
         "review_path": str(review_path),
         "result_path": str(result_path),
+        "worktree_task_path": str(worktree_task_path),
+        "worktree_review_path": str(worktree_review_path),
+        "worktree_result_path": str(worktree_result_path),
     }
     write_text_file(meta_dir / "meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
     return meta
@@ -1098,6 +1392,397 @@ def get_worktree_run(run_id: str) -> dict | None:
     except Exception:
         return None
     return None
+
+
+def format_run_option_label(run: dict) -> str:
+    run_id = str(run.get("run_id", "-"))
+    name = str(run.get("name", run_id))
+    status = str(run.get("status", "-")).strip() or "-"
+    return f"{run_id} — {name} ({status})"
+
+
+def update_worktree_run_meta(run_id: str, updates: dict) -> dict:
+    meta_file = RUNS_ROOT / run_id / "meta.json"
+    current = get_worktree_run(run_id)
+    if not current:
+        raise PipelineError(f"Run nicht gefunden: {run_id}")
+    merged = dict(current)
+    merged.update(updates)
+    write_text_file(meta_file, json.dumps(merged, ensure_ascii=False, indent=2))
+    return normalize_run_meta(merged, meta_file)
+
+
+def build_review_input(user_input: str, result: dict) -> str:
+    sections = [
+        "## Ursprüngliche Aufgabe",
+        user_input.strip() or "-",
+        "",
+        f"## Profil\n{result.get('profile_label', result.get('profile_key', '-'))}",
+        f"## Modus\n{result.get('mode_name', '-')}",
+        "",
+    ]
+    if result.get("final_task_1"):
+        sections.extend(["## Analyse FINAL_TASK", result.get("final_task_1", "-"), ""])
+    if result.get("final_task_2"):
+        sections.extend(["## Lösungs FINAL_TASK", result.get("final_task_2", "-"), ""])
+    sections.extend([
+        "## Finale Antwort",
+        result.get("code_response", "").strip() or "-",
+    ])
+    return "\n".join(sections).strip()
+
+
+def parse_review_response(text: str) -> dict:
+    normalized = text.strip()
+    status_match = re.search(r"(?im)^\s*REVIEW_STATUS\s*:\s*(PASS|FAIL)\s*$", normalized)
+    summary_match = re.search(r"(?im)^\s*REVIEW_SUMMARY\s*:\s*(.+?)\s*$", normalized)
+    improvement_match = re.search(r"(?im)^\s*IMPROVEMENT_TASK\s*:\s*(.+?)\s*$", normalized)
+
+    issues_block = []
+    issues_match = re.search(
+        r"(?ims)^\s*REVIEW_ISSUES\s*:\s*(.+?)(?:^\s*IMPROVEMENT_TASK\s*:|\Z)",
+        normalized,
+    )
+    if issues_match:
+        block = issues_match.group(1).strip()
+        for line in block.splitlines():
+            cleaned = re.sub(r"^\s*[-*]\s*", "", line).strip()
+            if cleaned:
+                issues_block.append(cleaned)
+
+    status = status_match.group(1).upper() if status_match else "FAIL"
+    summary = summary_match.group(1).strip() if summary_match else "Keine klare Review-Zusammenfassung erhalten."
+    improvement_task = improvement_match.group(1).strip() if improvement_match else "NONE"
+    if not issues_block:
+        issues_block = ["Keine sauber auswertbaren Review-Punkte erkannt."]
+
+    return {
+        "status": status,
+        "summary": summary,
+        "issues": issues_block,
+        "improvement_task": improvement_task or "NONE",
+        "raw_response": normalized,
+    }
+
+
+def review_generated_output(host: str, model: str, user_input: str, result: dict) -> dict:
+    review_input = build_review_input(user_input, result)
+    review_prompt = AUTO_REVIEW_PROMPT.replace("[REVIEW_INPUT]", review_input)
+    review_meta = call_ollama_generate(host, model, review_prompt)
+    parsed = parse_review_response(review_meta["response"])
+    parsed["prompt"] = review_prompt
+    parsed["meta"] = review_meta
+    return parsed
+
+
+def build_improve_input(user_input: str, result: dict, review_data: dict) -> str:
+    lines = [
+        "## Ursprüngliche Aufgabe",
+        user_input.strip() or "-",
+        "",
+        f"## Profil\n{result.get('profile_label', result.get('profile_key', '-'))}",
+        f"## Modus\n{result.get('mode_name', '-')}",
+        "",
+    ]
+    if result.get("final_task_1"):
+        lines.extend(["## Analyse FINAL_TASK", result.get("final_task_1", "-"), ""])
+    if result.get("final_task_2"):
+        lines.extend(["## Lösungs FINAL_TASK", result.get("final_task_2", "-"), ""])
+    lines.extend([
+        "## Bisherige finale Antwort",
+        result.get("code_response", "").strip() or "-",
+        "",
+        "## Review-Zusammenfassung",
+        review_data.get("summary", "-"),
+        "",
+        "## Review-Probleme",
+    ])
+    for issue in review_data.get("issues", []):
+        lines.append(f"- {issue}")
+    lines.extend([
+        "",
+        "## Konkrete Verbesserungsaufgabe",
+        review_data.get("improvement_task", "NONE"),
+    ])
+    return "\n".join(lines).strip()
+
+
+def improve_generated_output(host: str, model: str, user_input: str, result: dict, review_data: dict) -> dict:
+    improve_input = build_improve_input(user_input, result, review_data)
+    improve_prompt = AUTO_IMPROVE_PROMPT.replace("[IMPROVE_INPUT]", improve_input)
+    improve_meta = call_ollama_generate(host, model, improve_prompt)
+    return {
+        "prompt": improve_prompt,
+        "meta": improve_meta,
+        "response": improve_meta["response"],
+    }
+
+
+def apply_automated_workflow(user_input: str, host: str, model: str, result: dict, auto_review: bool, auto_improve: bool) -> dict:
+    automation = {
+        "auto_review_enabled": auto_review,
+        "auto_improve_enabled": auto_improve,
+        "status": "not_run",
+    }
+    if not auto_review:
+        result["automation"] = automation
+        return result
+
+    initial_review = review_generated_output(host, model, user_input, result)
+    automation["initial_review"] = {
+        "status": initial_review.get("status", "FAIL"),
+        "summary": initial_review.get("summary", "-"),
+        "issues": initial_review.get("issues", []),
+        "improvement_task": initial_review.get("improvement_task", "NONE"),
+        "raw_response": initial_review.get("raw_response", ""),
+        "prompt": initial_review.get("prompt", ""),
+    }
+    automation["initial_review_meta"] = initial_review.get("meta", {})
+
+    if initial_review.get("status") == "PASS":
+        automation["status"] = "pass"
+        automation["final_review"] = automation["initial_review"]
+        automation["final_review_meta"] = automation["initial_review_meta"]
+        result["automation"] = automation
+        return result
+
+    if not auto_improve or str(initial_review.get("improvement_task", "NONE")).strip().upper() == "NONE":
+        automation["status"] = "review_fail"
+        automation["final_review"] = automation["initial_review"]
+        automation["final_review_meta"] = automation["initial_review_meta"]
+        result["automation"] = automation
+        return result
+
+    original_response = result.get("code_response", "")
+    improve_result = improve_generated_output(host, model, user_input, result, initial_review)
+    result["original_code_response"] = original_response
+    result["code_response"] = improve_result.get("response", original_response)
+    result["automation_improved"] = True
+
+    automation["improvement"] = {
+        "prompt": improve_result.get("prompt", ""),
+        "response": improve_result.get("response", ""),
+    }
+    automation["improve_meta"] = improve_result.get("meta", {})
+
+    final_review = review_generated_output(host, model, user_input, result)
+    automation["final_review"] = {
+        "status": final_review.get("status", "FAIL"),
+        "summary": final_review.get("summary", "-"),
+        "issues": final_review.get("issues", []),
+        "improvement_task": final_review.get("improvement_task", "NONE"),
+        "raw_response": final_review.get("raw_response", ""),
+        "prompt": final_review.get("prompt", ""),
+    }
+    automation["final_review_meta"] = final_review.get("meta", {})
+    automation["status"] = "improved_pass" if final_review.get("status") == "PASS" else "improved_fail"
+
+    result["automation"] = automation
+    return result
+
+
+def build_run_task_markdown(run_meta: dict, user_input: str, result: dict, profile_label: str, mode_name: str, model: str) -> str:
+    lines = [
+        "# Task",
+        "",
+        f"Run: {run_meta.get('run_id', '-')}",
+        f"Name: {run_meta.get('name', '-')}",
+        f"Aktualisiert: {datetime.now().isoformat(timespec='seconds')}",
+        f"Profil: {profile_label}",
+        f"Modus: {mode_name}",
+        f"Modell: {model}",
+        "",
+        "## Roh-Prompt",
+        "",
+        user_input.strip() or "-",
+        "",
+    ]
+    if result.get("mode") == "pipeline":
+        lines.extend([
+            "## Analyse FINAL_TASK",
+            "",
+            result.get("final_task_1", "-"),
+            "",
+            "## Lösungs FINAL_TASK",
+            "",
+            result.get("final_task_2", "-"),
+            "",
+            "## Analyse-Prompt",
+            "",
+            "```text",
+            result.get("analyse_prompt", "").strip(),
+            "```",
+            "",
+            "## Lösungs-Prompt",
+            "",
+            "```text",
+            result.get("loesung_prompt", "").strip(),
+            "```",
+            "",
+            "## Code-Prompt",
+            "",
+            "```text",
+            result.get("code_prompt", "").strip(),
+            "```",
+        ])
+    else:
+        lines.extend([
+            "## Prompt",
+            "",
+            "```text",
+            result.get("code_prompt", "").strip(),
+            "```",
+        ])
+    return "\n".join(lines).strip() + "\n"
+
+
+def build_run_review_markdown(run_meta: dict, result: dict, output_path: Path) -> str:
+    stats = collect_run_stats(result)
+    automation = result.get("automation", {}) if isinstance(result, dict) else {}
+    final_review = automation.get("final_review") or automation.get("initial_review") or {}
+    auto_status = automation.get("status", "not_run")
+
+    lines = [
+        "# Review",
+        "",
+        f"Run: {run_meta.get('run_id', '-')}",
+        f"Aktualisiert: {datetime.now().isoformat(timespec='seconds')}",
+        f"Status: {auto_status}",
+        "",
+        "## Zusammenfassung",
+        "",
+        f"- Profil: {result.get('profile_label', result.get('profile_key', '-'))}",
+        f"- Modus: {result.get('mode_name', '-')}",
+        f"- Modell: {result.get('model', '-')}",
+        f"- Schritte: {stats.get('steps', 0)}",
+        f"- Input-Tokens: {stats.get('input_tokens', 0)}",
+        f"- Output-Tokens: {stats.get('output_tokens', 0)}",
+        f"- Dauer: {format_duration_ns(stats.get('total_duration', 0))}",
+        f"- Ergebnisdatei: {output_path}",
+        "",
+        "## Automatische Bewertung",
+        "",
+        f"- Review-Status: {final_review.get('status', '-')}",
+        f"- Zusammenfassung: {final_review.get('summary', '-')}",
+        f"- Automatische Verbesserung: {'Ja' if automation.get('improvement') else 'Nein'}",
+        "",
+        "## Review-Punkte",
+        "",
+    ]
+
+    for issue in final_review.get("issues", []):
+        lines.append(f"- {issue}")
+
+    if not final_review.get("issues"):
+        lines.append("- Keine automatisch erkannten Punkte.")
+
+    lines.extend([
+        "",
+        "## Manuelle Freigabe",
+        "",
+        "- [ ] Ergebnis fachlich geprüft",
+        "- [ ] Ergebnis freigegeben",
+        "- [ ] Weitere Nacharbeit nötig",
+    ])
+    return "\n".join(lines).strip() + "\n"
+
+def write_run_execution_artifacts(run_id: str, user_input: str, output_filename: str, result: dict) -> dict:
+    run_meta = get_worktree_run(run_id)
+    if not run_meta:
+        raise PipelineError(f"Aktiver Run nicht gefunden: {run_id}")
+
+    meta_dir = Path(str(run_meta.get("meta_path", RUNS_ROOT / run_id)))
+    worktree_dir = Path(str(run_meta.get("worktree_path", WORKTREES_ROOT / run_id)))
+    task_path = Path(str(run_meta.get("task_path", meta_dir / "task.md")))
+    review_path = Path(str(run_meta.get("review_path", meta_dir / "review.md")))
+    result_path = Path(str(run_meta.get("result_path", meta_dir / "result.json")))
+    worktree_task_path = Path(str(run_meta.get("worktree_task_path", worktree_dir / "task.md")))
+    worktree_review_path = Path(str(run_meta.get("worktree_review_path", worktree_dir / "review.md")))
+    worktree_result_path = Path(str(run_meta.get("worktree_result_path", worktree_dir / "result.json")))
+    outputs_dir = meta_dir / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    worktree_outputs_dir = worktree_dir / "outputs"
+    if worktree_dir.exists() and worktree_dir.is_dir():
+        worktree_outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    normalized_name = normalize_output_filename(Path(output_filename).stem, Path(output_filename).suffix or ".txt")
+    output_path = outputs_dir / normalized_name
+    write_text_file(output_path, result.get("code_response", ""))
+    worktree_output_path = worktree_outputs_dir / normalized_name if worktree_dir.exists() and worktree_dir.is_dir() else None
+    if worktree_output_path is not None:
+        write_text_file(worktree_output_path, result.get("code_response", ""))
+
+    task_content = build_run_task_markdown(
+        run_meta=run_meta,
+        user_input=user_input,
+        result=result,
+        profile_label=result.get("profile_label", result.get("profile_key", "-")),
+        mode_name=result.get("mode_name", "-"),
+        model=result.get("model", "-"),
+    )
+    review_content = build_run_review_markdown(run_meta=run_meta, result=result, output_path=output_path)
+    write_text_file(task_path, task_content)
+    write_text_file(review_path, review_content)
+    if worktree_dir.exists() and worktree_dir.is_dir():
+        write_text_file(worktree_task_path, task_content)
+        write_text_file(worktree_review_path, review_content)
+
+    stats = collect_run_stats(result)
+    result_payload = {
+        "run_id": run_id,
+        "status": "result_written",
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "profile_key": result.get("profile_key"),
+        "profile_label": result.get("profile_label"),
+        "mode_name": result.get("mode_name"),
+        "model": result.get("model"),
+        "output_filename": normalized_name,
+        "output_path": str(output_path),
+        "stats": stats,
+        "final_task_1": result.get("final_task_1"),
+        "final_task_2": result.get("final_task_2"),
+        "code_response": result.get("code_response", ""),
+        "original_code_response": result.get("original_code_response"),
+        "automation": result.get("automation", {}),
+    }
+    result_json = json.dumps(result_payload, ensure_ascii=False, indent=2)
+    write_text_file(result_path, result_json)
+    if worktree_dir.exists() and worktree_dir.is_dir():
+        write_text_file(worktree_result_path, result_json)
+
+    updated_meta = update_worktree_run_meta(
+        run_id,
+        {
+            "status": "result_written",
+            "last_result_at": result_payload["updated_at"],
+            "last_profile_key": result.get("profile_key"),
+            "last_profile_label": result.get("profile_label"),
+            "last_mode_name": result.get("mode_name"),
+            "last_model": result.get("model"),
+            "last_output_path": str(output_path),
+            "last_review_status": (result.get("automation", {}).get("final_review") or result.get("automation", {}).get("initial_review") or {}).get("status"),
+            "last_automation_status": result.get("automation", {}).get("status"),
+            "task_path": str(task_path),
+            "review_path": str(review_path),
+            "result_path": str(result_path),
+            "worktree_task_path": str(worktree_task_path),
+            "worktree_review_path": str(worktree_review_path),
+            "worktree_result_path": str(worktree_result_path),
+            "worktree_output_path": str(worktree_output_path) if worktree_output_path is not None else None,
+        },
+    )
+    return {
+        "run_id": run_id,
+        "task_path": str(task_path),
+        "review_path": str(review_path),
+        "result_path": str(result_path),
+        "output_path": str(output_path),
+        "worktree_task_path": str(worktree_task_path),
+        "worktree_review_path": str(worktree_review_path),
+        "worktree_result_path": str(worktree_result_path),
+        "worktree_output_path": str(worktree_output_path) if worktree_output_path is not None else None,
+        "meta": updated_meta,
+    }
 
 
 def remove_worktree_run(run_id: str) -> None:
@@ -1145,6 +1830,11 @@ st.session_state.setdefault("output_extension", ".py")
 st.session_state.setdefault("output_extension_mode", "Vorgabe")
 st.session_state.setdefault("output_extension_custom", "")
 st.session_state.setdefault("keep_alive_value", "30m")
+st.session_state.setdefault("auto_review_enabled", True)
+st.session_state.setdefault("auto_improve_enabled", True)
+st.session_state.setdefault("codex_handoff_enabled", True)
+st.session_state.setdefault("open_vscode_after_run", False)
+st.session_state.setdefault("codex_exec_after_run", False)
 
 if st.session_state.pop("_force_full_reload", False):
     st.session_state.pop("last_result", None)
@@ -1163,6 +1853,9 @@ if st.session_state.pop("_force_full_reload", False):
     </script>
     """, height=0)
     st.stop()
+
+run_refresh_notice = st.session_state.pop("_run_refresh_notice", "")
+manual_codex_notice = st.session_state.pop("_codex_exec_notice", "")
 
 st.title("Ollama GUI")
 st.caption("Oberfläche mit Profilen, Dateiübersicht und Skript-Ausführung")
@@ -1440,7 +2133,43 @@ with main_area.container():
                 profile_config = get_profile_config(profile_key, mode_name)
                 st.markdown(f"**Zielmodell:** `{model}`")
 
-                stats = collect_run_stats(st.session_state.get("last_result"))
+                available_runs_for_code = list_worktree_runs()
+                run_choices = [""] + [run["run_id"] for run in available_runs_for_code]
+                current_run_id = st.session_state.get("selected_run_id") or ""
+                if current_run_id not in run_choices:
+                    current_run_id = ""
+                selected_run_for_code = st.selectbox(
+                    "Aktiver Run",
+                    options=run_choices,
+                    index=run_choices.index(current_run_id),
+                    format_func=lambda run_id: "Kein Run ausgewählt" if not run_id else format_run_option_label(get_worktree_run(run_id) or {"run_id": run_id}),
+                    key="code_run_selector",
+                )
+                st.session_state["selected_run_id"] = selected_run_for_code or None
+                active_run_meta = get_worktree_run(selected_run_for_code) if selected_run_for_code else None
+                if active_run_meta:
+                    st.caption(f"Worktree: {active_run_meta.get('worktree_path', '-')}")
+                    run_open_col, run_meta_col = st.columns(2)
+                    with run_open_col:
+                        if st.button("Worktree öffnen", use_container_width=True, key="code_open_active_worktree"):
+                            try:
+                                open_folder_in_explorer(Path(str(active_run_meta.get("worktree_path", ""))))
+                            except Exception as exc:
+                                st.exception(exc)
+                    with run_meta_col:
+                        if st.button("Run-Meta öffnen", use_container_width=True, key="code_open_active_run_meta"):
+                            try:
+                                open_folder_in_explorer(Path(str(active_run_meta.get("meta_path", ""))))
+                            except Exception as exc:
+                                st.exception(exc)
+                else:
+                    st.caption("Kein aktiver Run ausgewählt. Ergebnis bleibt nur in der GUI, bis du einen Run wählst.")
+
+                last_result_for_stats = st.session_state.get("last_result")
+                if isinstance(last_result_for_stats, dict):
+                    stats = last_result_for_stats.get("workflow_stats") or collect_run_stats(last_result_for_stats)
+                else:
+                    stats = {"input_tokens": 0, "output_tokens": 0, "total_duration": 0, "steps": 0}
                 m1, m2 = st.columns(2)
                 m1.metric("Input-Tokens gesamt", format_tokens(stats["input_tokens"]))
                 m2.metric("Output-Tokens gesamt", format_tokens(stats["output_tokens"]))
@@ -1505,6 +2234,68 @@ with main_area.container():
 
             output_filename = normalize_output_filename(output_base_name, output_extension)
 
+            st.markdown("**Automatischer Ablauf**")
+            workflow_col1, workflow_col2 = st.columns(2)
+            with workflow_col1:
+                auto_review_enabled = st.checkbox(
+                    "Output automatisch prüfen",
+                    key="auto_review_enabled",
+                    help="Prüft die erzeugte finale Antwort automatisch gegen Aufgabe und Ergebnis.",
+                )
+            with workflow_col2:
+                auto_improve_enabled = st.checkbox(
+                    "Bei Bedarf einmal verbessern",
+                    key="auto_improve_enabled",
+                    disabled=not auto_review_enabled,
+                    help="Führt nach einem fehlgeschlagenen Review genau einen automatischen Verbesserungsdurchlauf aus.",
+                )
+            if auto_review_enabled:
+                if auto_improve_enabled:
+                    st.caption("Ein Klick führt jetzt Aufbereitung, Ausführung, Review und einen möglichen Verbesserungsdurchlauf aus.")
+                else:
+                    st.caption("Ein Klick führt jetzt Aufbereitung, Ausführung und automatisches Review aus.")
+            else:
+                st.caption("Ein Klick führt nur Aufbereitung und Ausführung aus.")
+
+            active_run_meta = get_worktree_run(st.session_state.get("selected_run_id", "")) if st.session_state.get("selected_run_id") else None
+            codex_exec_btn = False
+            if active_run_meta:
+                st.markdown("**Übergabe an VS Code / Codex**")
+                handoff_col1, handoff_col2 = st.columns(2)
+                with handoff_col1:
+                    st.checkbox(
+                        "Handoff-Datei für aktiven Run schreiben",
+                        key="codex_handoff_enabled",
+                        help="Schreibt nach dem Lauf eine Codex-Handoff-Datei in den Run und in den Worktree.",
+                    )
+                with handoff_col2:
+                    st.checkbox(
+                        "Worktree danach in VS Code öffnen",
+                        key="open_vscode_after_run",
+                        disabled=not command_exists("code"),
+                        help="Öffnet den Worktree nach dem Lauf direkt in VS Code. Funktioniert nur, wenn der Befehl 'code' verfügbar ist.",
+                    )
+                codex_col1, codex_col2 = st.columns(2)
+                with codex_col1:
+                    st.checkbox(
+                        "Codex nach Handoff automatisch starten",
+                        key="codex_exec_after_run",
+                        disabled=not codex_available(),
+                        help="Startet Codex CLI nach dem Lauf direkt im aktiven Worktree auf Basis von CODEX_HANDOFF.md.",
+                    )
+                with codex_col2:
+                    codex_exec_btn = st.button(
+                        "Mit Codex im aktiven Worktree ausführen",
+                        use_container_width=True,
+                        disabled=not codex_available(),
+                        help="Startet codex exec im aktiven Worktree und nutzt CODEX_HANDOFF.md als Grundlage.",
+                    )
+                st.caption(f"Aktiver Run: {active_run_meta.get('run_id', '-')} → {active_run_meta.get('worktree_path', '-')}")
+                if not command_exists("code"):
+                    st.caption("VS Code CLI 'code' wurde nicht gefunden. Handoff-Dateien werden trotzdem geschrieben.")
+                if not codex_available():
+                    st.caption("Codex CLI wurde nicht gefunden. Installiere Codex CLI und melde dich lokal an.")
+
             if is_advanced and ui_settings.get("show_active_prompt_files", True):
                 st.subheader("Aktive Prompt-Dateien")
                 if profile_config["kind"] == "pipeline":
@@ -1519,14 +2310,14 @@ with main_area.container():
                 else:
                     st.code(f"Code: {profile_config['code'].relative_to(APP_ROOT)}", language="text")
 
-            run_btn = st.button("Code erzeugen", type="primary", use_container_width=True)
+            run_btn = st.button("Automatischen Lauf starten", type="primary", use_container_width=True)
 
         if run_btn:
             if not user_input.strip():
                 st.error("Bitte zuerst einen Prompt eingeben.")
             else:
                 try:
-                    with st.spinner("Code wird erzeugt..."):
+                    with st.spinner("Ablauf wird ausgeführt..."):
                         if profile_config["kind"] == "pipeline":
                             result = run_pipeline_mode(
                                 user_input=user_input.strip(),
@@ -1547,15 +2338,101 @@ with main_area.container():
                     result["profile_label"] = profile_labels.get(profile_key, profile_key)
                     result["mode_name"] = mode_name
                     result["model"] = model
+                    result = apply_automated_workflow(
+                        user_input=user_input.strip(),
+                        host=ollama_host,
+                        model=model,
+                        result=result,
+                        auto_review=st.session_state.get("auto_review_enabled", True),
+                        auto_improve=st.session_state.get("auto_improve_enabled", True),
+                    )
+                    active_run_id = st.session_state.get("selected_run_id")
+                    if active_run_id:
+                        result["run_write"] = write_run_execution_artifacts(
+                            run_id=active_run_id,
+                            user_input=user_input.strip(),
+                            output_filename=output_filename,
+                            result=result,
+                        )
+                        if st.session_state.get("codex_handoff_enabled", True):
+                            result["codex_handoff"] = write_codex_handoff_artifacts(
+                                run_id=active_run_id,
+                                user_input=user_input.strip(),
+                                result=result,
+                                run_write=result.get("run_write"),
+                            )
+                            if st.session_state.get("open_vscode_after_run", False):
+                                try:
+                                    open_in_vscode(Path(str(result["codex_handoff"].get("worktree_path", ""))))
+                                    result["codex_handoff"]["vscode_opened"] = True
+                                except Exception as exc:
+                                    result["codex_handoff_error"] = str(exc)
+                            if st.session_state.get("codex_exec_after_run", False):
+                                try:
+                                    with st.spinner("Codex arbeitet im aktiven Worktree..."):
+                                        result["codex_exec"] = execute_codex_for_run(active_run_id)
+                                except Exception as exc:
+                                    result["codex_exec_error"] = str(exc)
+                    result["workflow_stats"] = collect_run_stats(result)
                     st.session_state["last_result"] = result
                     st.session_state["last_output_filename"] = output_filename
+                    st.session_state["_run_refresh_notice"] = "Lauf abgeschlossen. Kennzahlen wurden aktualisiert."
+                    st.rerun()
                 except Exception as exc:
                     st.exception(exc)
 
+        if codex_exec_btn:
+            try:
+                if not active_run_meta:
+                    raise PipelineError("Kein aktiver Run ausgewählt.")
+                with st.spinner("Codex arbeitet im aktiven Worktree..."):
+                    codex_exec_result = execute_codex_for_run(str(active_run_meta.get("run_id", "")))
+                st.session_state["last_codex_exec"] = codex_exec_result
+                existing_result = st.session_state.get("last_result")
+                if isinstance(existing_result, dict):
+                    run_write = existing_result.get("run_write", {}) if isinstance(existing_result.get("run_write"), dict) else {}
+                    if run_write.get("run_id") == str(active_run_meta.get("run_id", "")):
+                        existing_result["codex_exec"] = codex_exec_result
+                        st.session_state["last_result"] = existing_result
+                st.session_state["_codex_exec_notice"] = "Codex wurde im aktiven Worktree ausgeführt."
+                st.rerun()
+            except Exception as exc:
+                st.exception(exc)
+
         result = st.session_state.get("last_result")
+        if run_refresh_notice:
+            st.success(run_refresh_notice)
+        if manual_codex_notice:
+            st.success(manual_codex_notice)
         if result:
             st.divider()
             st.subheader("Ergebnis")
+            if result.get("run_write"):
+                st.success(f"Aktiver Run aktualisiert: {result['run_write'].get('run_id', '-')}")
+            if result.get("codex_handoff"):
+                st.info(f"Codex-Handoff geschrieben: {result['codex_handoff'].get('handoff_worktree_path', result['codex_handoff'].get('handoff_path', '-'))}")
+            if result.get("codex_handoff_error"):
+                st.warning(f"VS Code konnte nicht automatisch geöffnet werden: {result['codex_handoff_error']}")
+            if result.get("codex_exec"):
+                codex_exec = result.get("codex_exec", {})
+                if int(codex_exec.get("returncode", 1)) == 0:
+                    st.success("Codex CLI wurde im aktiven Worktree erfolgreich ausgeführt.")
+                else:
+                    st.warning("Codex CLI wurde ausgeführt, aber mit einem Fehlercode beendet.")
+            if result.get("codex_exec_error"):
+                st.warning(f"Codex CLI konnte nicht ausgeführt werden: {result['codex_exec_error']}")
+
+            automation = result.get("automation", {})
+            final_review = automation.get("final_review") or automation.get("initial_review") or {}
+            if automation.get("auto_review_enabled"):
+                review_status = final_review.get("status", "-")
+                review_summary = final_review.get("summary", "-")
+                if automation.get("status") in {"pass", "improved_pass"}:
+                    st.success(f"Automatische Prüfung: {review_status} – {review_summary}")
+                elif automation.get("status") in {"review_fail", "improved_fail"}:
+                    st.warning(f"Automatische Prüfung: {review_status} – {review_summary}")
+                else:
+                    st.info(f"Automatische Prüfung: {review_status} – {review_summary}")
 
             top1, top2, top3 = st.columns(3)
             top1.metric("Modell", result.get("model", model))
@@ -1575,6 +2452,35 @@ with main_area.container():
                 "Dauer",
                 format_duration_ns(metric_value(result["code_meta"], "total_duration")),
             )
+
+            automation = result.get("automation", {})
+            if automation.get("auto_review_enabled"):
+                final_review = automation.get("final_review") or automation.get("initial_review") or {}
+                with st.expander("Automatische Prüfung", expanded=is_advanced):
+                    review_col1, review_col2 = st.columns(2)
+                    with review_col1:
+                        st.markdown(f"**Status:** `{final_review.get('status', '-')}`")
+                        st.markdown(f"**Ablaufstatus:** `{automation.get('status', '-')}`")
+                        st.markdown(f"**Zusammenfassung:** {final_review.get('summary', '-')}")
+                    with review_col2:
+                        issues = final_review.get("issues", [])
+                        if issues:
+                            st.markdown("**Punkte**")
+                            for issue in issues:
+                                st.markdown(f"- {issue}")
+                        else:
+                            st.markdown("**Punkte:** Keine automatisch erkannten Punkte.")
+                    if is_advanced and ui_settings.get("show_result_prompts", True):
+                        initial_review = automation.get("initial_review", {})
+                        if initial_review:
+                            st.markdown("**Review-Antwort**")
+                            st.code(initial_review.get("raw_response", ""), language="text")
+                        if automation.get("improvement"):
+                            st.markdown("**Verbesserter Output**")
+                            st.code(result.get("code_response", ""), language="text")
+                            if automation.get("final_review", {}).get("raw_response"):
+                                st.markdown("**Finale Review-Antwort**")
+                                st.code(automation.get("final_review", {}).get("raw_response", ""), language="text")
 
             if result["mode"] == "pipeline":
                 if is_advanced and ui_settings.get("show_result_prompts", True):
@@ -1609,7 +2515,24 @@ with main_area.container():
                 else:
                     st.code(result["code_response"], language="text")
 
-            save_col, open_col, download_col = st.columns(3)
+            if result.get("codex_exec"):
+                codex_exec = result.get("codex_exec", {})
+                with st.expander("Codex CLI Ergebnis", expanded=False):
+                    codex_info_col1, codex_info_col2 = st.columns(2)
+                    with codex_info_col1:
+                        st.markdown(f"**Returncode:** `{codex_exec.get('returncode', '-')}`")
+                        st.markdown(f"**Ausgeführt am:** `{codex_exec.get('executed_at', '-')}`")
+                        st.markdown(f"**Worktree:** `{codex_exec.get('worktree_path', '-')}`")
+                    with codex_info_col2:
+                        st.markdown(f"**Handoff:** `{codex_exec.get('handoff_path', '-')}`")
+                        st.markdown(f"**Result-Datei:** `{codex_exec.get('result_path', '-')}`")
+                    st.markdown("**Finale Codex-Nachricht (stdout)**")
+                    st.code(codex_exec.get("stdout", ""), language="text")
+                    if codex_exec.get("stderr"):
+                        st.markdown("**Codex stderr**")
+                        st.code(codex_exec.get("stderr", ""), language="text")
+
+            save_col, open_col, download_col, vscode_col, handoff_col = st.columns(5)
             with save_col:
                 if st.button("Output nach workspace/output speichern", use_container_width=True):
                     out_path = save_output_file(
@@ -1631,6 +2554,20 @@ with main_area.container():
                     mime="text/plain",
                     use_container_width=True,
                 )
+            with vscode_col:
+                if st.button("Run in VS Code öffnen", use_container_width=True, disabled=not bool(result.get("codex_handoff"))):
+                    try:
+                        if result.get("codex_handoff"):
+                            open_in_vscode(Path(str(result["codex_handoff"].get("worktree_path", ""))))
+                    except Exception as exc:
+                        st.exception(exc)
+            with handoff_col:
+                if st.button("Handoff Ordner öffnen", use_container_width=True, disabled=not bool(result.get("codex_handoff"))):
+                    try:
+                        if result.get("codex_handoff"):
+                            open_folder_in_explorer(Path(str(result["codex_handoff"].get("handoff_path", ""))).parent)
+                    except Exception as exc:
+                        st.exception(exc)
     if "runs" in tabs_by_key:
         with tabs_by_key["runs"]:
             st.subheader("Runs")
@@ -1676,7 +2613,7 @@ with main_area.container():
                         "Run auswählen",
                         options=run_options,
                         index=run_options.index(current_run_id),
-                        format_func=lambda run_id: f"{run_id} — {get_worktree_run(run_id).get('name', run_id)}",
+                        format_func=lambda run_id: format_run_option_label(get_worktree_run(run_id) or {"run_id": run_id}),
                     )
                     st.session_state["selected_run_id"] = selected_run_id
                     selected_run = get_worktree_run(selected_run_id)
@@ -1694,7 +2631,7 @@ with main_area.container():
                             st.markdown(f"**Worktree:** `{selected_run.get('worktree_path', '-')}`")
                             st.markdown(f"**Meta:** `{selected_run.get('meta_path', '-')}`")
 
-                        action_col1, action_col2, action_col3 = st.columns(3)
+                        action_col1, action_col2, action_col3, action_col4 = st.columns(4)
                         with action_col1:
                             if st.button("Worktree öffnen", use_container_width=True):
                                 try:
@@ -1702,12 +2639,18 @@ with main_area.container():
                                 except Exception as exc:
                                     st.exception(exc)
                         with action_col2:
+                            if st.button("In VS Code öffnen", use_container_width=True, disabled=not command_exists("code")):
+                                try:
+                                    open_in_vscode(Path(str(selected_run.get("worktree_path", ""))))
+                                except Exception as exc:
+                                    st.exception(exc)
+                        with action_col3:
                             if st.button("Run-Meta öffnen", use_container_width=True):
                                 try:
                                     open_folder_in_explorer(Path(str(selected_run.get("meta_path", ""))))
                                 except Exception as exc:
                                     st.exception(exc)
-                        with action_col3:
+                        with action_col4:
                             confirm_delete_run = st.checkbox("Run löschen bestätigen", key=f"confirm_delete_run_{selected_run_id}")
                             if st.button("Run löschen", use_container_width=True, disabled=not confirm_delete_run):
                                 try:
