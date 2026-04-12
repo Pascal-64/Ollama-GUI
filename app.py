@@ -24,6 +24,8 @@ OUTPUT_ROOT = WORKSPACE_ROOT / "output"
 LOGS_ROOT = APP_ROOT / "logs"
 CONFIG_ROOT = APP_ROOT / "config"
 SETTINGS_FILE = CONFIG_ROOT / "ui_settings.json"
+RUNS_ROOT = WORKSPACE_ROOT / "runs"
+WORKTREES_ROOT = WORKSPACE_ROOT / "worktrees"
 
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".log", ".ini", ".json", ".yml", ".yaml", ".sql", ".ps1", ".bat", ".cmd",
@@ -284,7 +286,7 @@ def write_text_file(path: Path, content: str) -> None:
 
 
 def ensure_structure() -> None:
-    for path in [PROMPTS_ROOT, PROFILES_ROOT, SCRIPTS_ROOT, WORKSPACE_ROOT, OUTPUT_ROOT, LOGS_ROOT, CONFIG_ROOT]:
+    for path in [PROMPTS_ROOT, PROFILES_ROOT, SCRIPTS_ROOT, WORKSPACE_ROOT, OUTPUT_ROOT, LOGS_ROOT, CONFIG_ROOT, RUNS_ROOT, WORKTREES_ROOT]:
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -505,6 +507,8 @@ def project_structure_text() -> str:
         ("Profile", PROFILES_ROOT),
         ("Skripte", SCRIPTS_ROOT),
         ("Workspace", WORKSPACE_ROOT),
+        ("Runs", RUNS_ROOT),
+        ("Worktrees", WORKTREES_ROOT),
         ("Outputs", OUTPUT_ROOT),
         ("Logs", LOGS_ROOT),
         ("Config", CONFIG_ROOT),
@@ -815,6 +819,321 @@ def file_language(path: Path) -> str:
     return mapping.get(path.suffix.lower(), "text")
 
 
+def safe_read_preview_text(path: Path) -> str:
+    if not path.exists():
+        raise PipelineError(f"Datei nicht vorhanden: {path}")
+    if not path.is_file():
+        raise PipelineError(f"Pfad ist keine Datei: {path}")
+    return read_text_file(str(path))
+
+
+def normalize_run_meta(data: dict, meta_file: Path) -> dict:
+    normalized = dict(data)
+    run_id = str(normalized.get("run_id") or meta_file.parent.name)
+    meta_dir = meta_file.parent
+
+    meta_path_value = str(normalized.get("meta_path") or normalized.get("run_path") or meta_dir)
+    meta_dir_path = Path(meta_path_value)
+    if meta_dir_path.suffix.lower() == ".json":
+        meta_dir_path = meta_dir_path.parent
+
+    task_path = Path(str(normalized.get("task_path") or (meta_dir_path / "task.md")))
+    review_path = Path(str(normalized.get("review_path") or (meta_dir_path / "review.md")))
+    result_path = Path(str(normalized.get("result_path") or (meta_dir_path / "result.json")))
+    worktree_path = Path(str(normalized.get("worktree_path") or ""))
+
+    normalized["run_id"] = run_id
+    normalized["meta_path"] = str(meta_dir_path)
+    normalized["task_path"] = str(task_path)
+    normalized["review_path"] = str(review_path)
+    normalized["result_path"] = str(result_path)
+    normalized["worktree_exists"] = worktree_path.exists() if str(worktree_path) else False
+    return normalized
+
+
+def find_git_repo_root(start_path: Path) -> Path | None:
+    current = start_path.resolve()
+    for path in [current, *current.parents]:
+        git_marker = path / ".git"
+        if git_marker.exists():
+            return path
+    try:
+        process = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(start_path),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if process.returncode == 0:
+            value = (process.stdout or "").strip()
+            if value:
+                return Path(value)
+    except Exception:
+        pass
+    return None
+
+
+def is_git_repository(path: Path) -> bool:
+    return find_git_repo_root(path) is not None
+
+
+def git_run(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+def git_current_branch(repo_root: Path) -> str:
+    process = git_run(["branch", "--show-current"], cwd=repo_root)
+    if process.returncode == 0:
+        value = (process.stdout or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def git_default_branch(repo_root: Path) -> str:
+    process = git_run(["symbolic-ref", "refs/remotes/origin/HEAD"], cwd=repo_root)
+    if process.returncode == 0:
+        value = (process.stdout or "").strip()
+        if value.startswith("refs/remotes/origin/"):
+            return value.rsplit("/", 1)[-1]
+
+    current = git_current_branch(repo_root)
+    if current:
+        return current
+
+    for candidate in ("main", "master"):
+        verify = git_run(["rev-parse", "--verify", candidate], cwd=repo_root)
+        if verify.returncode == 0:
+            return candidate
+        verify_remote = git_run(["rev-parse", "--verify", f"origin/{candidate}"], cwd=repo_root)
+        if verify_remote.returncode == 0:
+            return candidate
+
+    return "main"
+
+
+def git_ref_exists(repo_root: Path, git_ref: str) -> bool:
+    verify = git_run(["rev-parse", "--verify", f"{git_ref}^{{commit}}"], cwd=repo_root)
+    return verify.returncode == 0
+
+
+def list_available_git_refs(repo_root: Path) -> list[str]:
+    process = git_run(
+        [
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes/origin",
+        ],
+        cwd=repo_root,
+    )
+    if process.returncode != 0:
+        return []
+    refs = []
+    for line in (process.stdout or "").splitlines():
+        value = line.strip()
+        if value and value != "origin/HEAD":
+            refs.append(value)
+    return sorted(dict.fromkeys(refs))
+
+
+def build_base_ref_candidates(repo_root: Path, requested_ref: str) -> list[tuple[str, str]]:
+    requested = (requested_ref or "").strip()
+    default_branch = git_default_branch(repo_root)
+    current_branch = git_current_branch(repo_root)
+    candidates: list[tuple[str, str]] = []
+
+    def add_ref(ref_value: str, label: str) -> None:
+        ref_value = (ref_value or "").strip()
+        if ref_value:
+            candidates.append((ref_value, label))
+
+    def add_branch_variants(branch_name: str, label: str | None = None) -> None:
+        branch_name = (branch_name or "").strip()
+        if not branch_name:
+            return
+        display = label or branch_name
+        add_ref(branch_name, display)
+        add_ref(f"refs/heads/{branch_name}", display)
+        add_ref(f"origin/{branch_name}", display)
+        add_ref(f"refs/remotes/origin/{branch_name}", display)
+
+    if requested:
+        if requested.upper() == "HEAD":
+            add_ref("HEAD", "HEAD")
+        else:
+            add_branch_variants(requested, requested)
+
+    if default_branch and default_branch != requested:
+        add_branch_variants(default_branch, default_branch)
+    if current_branch and current_branch not in {requested, default_branch}:
+        add_branch_variants(current_branch, current_branch)
+
+    add_ref("HEAD", current_branch or default_branch or requested or "HEAD")
+
+    seen: set[str] = set()
+    unique_candidates: list[tuple[str, str]] = []
+    for ref_value, label in candidates:
+        if ref_value in seen:
+            continue
+        seen.add(ref_value)
+        unique_candidates.append((ref_value, label))
+    return unique_candidates
+
+
+
+def slugify_run_name(label: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "-", (label or "").strip().lower())
+    cleaned = re.sub(r"-+", "-", cleaned).strip("-")
+    return cleaned or "run"
+
+
+def create_worktree_run(run_name: str, base_ref: str = "main") -> dict:
+    repo_root = find_git_repo_root(APP_ROOT)
+    if not repo_root:
+        raise PipelineError("Dieses Projekt ist kein Git-Repository.")
+
+    run_slug = slugify_run_name(run_name)
+    created_dt = datetime.now()
+    run_id = f"{created_dt.strftime('%Y%m%d_%H%M%S')}_{run_slug}"
+    branch_name = f"run/{run_slug}-{created_dt.strftime('%Y%m%d_%H%M%S')}"
+    worktree_path = WORKTREES_ROOT / run_id
+    meta_dir = RUNS_ROOT / run_id
+    task_path = meta_dir / "task.md"
+    review_path = meta_dir / "review.md"
+    result_path = meta_dir / "result.json"
+    requested_base_ref = (base_ref or "").strip() or git_default_branch(repo_root) or "HEAD"
+
+    candidate_refs = build_base_ref_candidates(repo_root, requested_base_ref)
+    attempt_errors: list[str] = []
+    successful_ref = ""
+    resolved_base_branch = requested_base_ref
+
+    for candidate_ref, display_name in candidate_refs:
+        add_process = git_run(["worktree", "add", "-b", branch_name, str(worktree_path), candidate_ref], cwd=repo_root)
+        if add_process.returncode == 0:
+            successful_ref = candidate_ref
+            resolved_base_branch = display_name
+            break
+        error_text = (add_process.stderr or add_process.stdout or "Unbekannter Git-Fehler").strip()
+        attempt_errors.append(f"{candidate_ref}: {error_text}")
+        if worktree_path.exists() and not any(worktree_path.iterdir()):
+            try:
+                worktree_path.rmdir()
+            except OSError:
+                pass
+
+    if not successful_ref:
+        available_refs = list_available_git_refs(repo_root)
+        available_preview = ", ".join(available_refs[:20]) if available_refs else "keine gefunden"
+        attempts_preview = "\n".join(f"- {entry}" for entry in attempt_errors) if attempt_errors else "- keine Versuche protokolliert"
+        raise PipelineError(
+            f"Basis-Ref konnte nicht verwendet werden: {requested_base_ref}.\n"
+            f"Erkannter Standard-Branch: {git_default_branch(repo_root) or 'unbekannt'}.\n"
+            f"Gefundene Refs: {available_preview}\n\n"
+            f"Getestete Git-Aufrufe:\n{attempts_preview}"
+        )
+
+    used_base_ref = successful_ref
+
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    task_path.write_text(f"# Task\n\nRun: {run_id}\nName: {run_name}\n\n", encoding="utf-8")
+    review_path.write_text(f"# Review\n\nRun: {run_id}\n\n", encoding="utf-8")
+    result_path.write_text(json.dumps({"run_id": run_id, "status": "created"}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    meta = {
+        "run_id": run_id,
+        "name": run_name,
+        "branch": branch_name,
+        "base_branch": resolved_base_branch,
+        "base_ref": used_base_ref,
+        "requested_base_ref": requested_base_ref,
+        "status": "created",
+        "created_at": created_dt.isoformat(timespec="seconds"),
+        "repo_root": str(repo_root),
+        "worktree_path": str(worktree_path),
+        "meta_path": str(meta_dir),
+        "task_path": str(task_path),
+        "review_path": str(review_path),
+        "result_path": str(result_path),
+    }
+    write_text_file(meta_dir / "meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
+    return meta
+
+def list_worktree_runs() -> list[dict]:
+    runs: list[dict] = []
+    if not RUNS_ROOT.exists():
+        return runs
+    for meta_dir in sorted([p for p in RUNS_ROOT.iterdir() if p.is_dir()], key=lambda p: p.name.lower(), reverse=True):
+        meta_file = meta_dir / "meta.json"
+        if not meta_file.exists():
+            continue
+        try:
+            data = json.loads(meta_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                runs.append(normalize_run_meta(data, meta_file))
+        except Exception:
+            continue
+    return runs
+
+
+def get_worktree_run(run_id: str) -> dict | None:
+    meta_file = RUNS_ROOT / run_id / "meta.json"
+    if not meta_file.exists():
+        return None
+    try:
+        data = json.loads(meta_file.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return normalize_run_meta(data, meta_file)
+    except Exception:
+        return None
+    return None
+
+
+def remove_worktree_run(run_id: str) -> None:
+    meta = get_worktree_run(run_id)
+    if not meta:
+        raise PipelineError(f"Run nicht gefunden: {run_id}")
+
+    repo_root = find_git_repo_root(APP_ROOT)
+    if not repo_root:
+        raise PipelineError("Dieses Projekt ist kein Git-Repository.")
+
+    worktree_path = Path(str(meta.get("worktree_path", "")))
+    branch_name = str(meta.get("branch", "")).strip()
+
+    if worktree_path.exists():
+        remove_process = git_run(["worktree", "remove", "--force", str(worktree_path)], cwd=repo_root)
+        if remove_process.returncode != 0:
+            raise PipelineError((remove_process.stderr or remove_process.stdout or "Worktree konnte nicht entfernt werden.").strip())
+
+    if branch_name:
+        delete_branch = git_run(["branch", "-D", branch_name], cwd=repo_root)
+        if delete_branch.returncode != 0:
+            raise PipelineError((delete_branch.stderr or delete_branch.stdout or "Branch konnte nicht gelöscht werden.").strip())
+
+    meta_dir = RUNS_ROOT / run_id
+    if meta_dir.exists():
+        shutil.rmtree(meta_dir)
+
+
+def run_summary_counts(runs: list[dict]) -> tuple[int, int, int]:
+    total = len(runs)
+    existing = sum(1 for run in runs if run.get("worktree_exists"))
+    missing = total - existing
+    return total, existing, missing
+
+
 ensure_structure()
 profile_labels = bootstrap_profiles()
 
@@ -1090,6 +1409,7 @@ main_area = st.empty()
 with main_area.container():
     tab_definitions = [("Code", "code")]
     if is_advanced:
+        tab_definitions.append(("Runs", "runs"))
         tab_definitions.append(("Profile", "profiles"))
     if is_advanced and ui_settings.get("show_files_tab", True):
         tab_definitions.append(("Dateien", "files"))
@@ -1311,6 +1631,116 @@ with main_area.container():
                     mime="text/plain",
                     use_container_width=True,
                 )
+    if "runs" in tabs_by_key:
+        with tabs_by_key["runs"]:
+            st.subheader("Runs")
+            repo_root = find_git_repo_root(APP_ROOT)
+            if not repo_root:
+                st.warning("Dieses Projekt ist aktuell kein Git-Repository. Der Runs-Tab benötigt ein initialisiertes Git-Repo.")
+            else:
+                st.caption(f"Git-Repo: {repo_root}")
+
+                with st.expander("Neuen Run anlegen", expanded=True):
+                    run_create_col1, run_create_col2 = st.columns([1.8, 1.0])
+                    with run_create_col1:
+                        run_name_input = st.text_input("Run-Name", placeholder="z. B. csv-dedupe", key="run_name_input")
+                    with run_create_col2:
+                        run_base_branch = st.text_input("Basis-Ref", value=git_default_branch(repo_root), key="run_base_branch")
+                        st.caption(f"Erkannter Standard-Branch: {git_default_branch(repo_root)}")
+                        st.caption("Erlaubt sind z. B. main, origin/main, refs/heads/main oder HEAD.")
+                    if st.button("Run anlegen", use_container_width=True, type="primary"):
+                        if not run_name_input.strip():
+                            st.error("Bitte zuerst einen Run-Namen eingeben.")
+                        else:
+                            try:
+                                meta = create_worktree_run(run_name_input.strip(), run_base_branch.strip() or git_default_branch(repo_root) or "HEAD")
+                                st.session_state["selected_run_id"] = meta["run_id"]
+                                st.success(f"Run erstellt: {meta['run_id']}")
+                                st.rerun()
+                            except Exception as exc:
+                                st.exception(exc)
+
+                runs = list_worktree_runs()
+                total_runs, active_runs, missing_runs = run_summary_counts(runs)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Runs gesamt", str(total_runs))
+                c2.metric("Worktrees vorhanden", str(active_runs))
+                c3.metric("Fehlend", str(missing_runs))
+
+                if runs:
+                    run_options = [run["run_id"] for run in runs]
+                    current_run_id = st.session_state.get("selected_run_id")
+                    if current_run_id not in run_options:
+                        current_run_id = run_options[0]
+                    selected_run_id = st.selectbox(
+                        "Run auswählen",
+                        options=run_options,
+                        index=run_options.index(current_run_id),
+                        format_func=lambda run_id: f"{run_id} — {get_worktree_run(run_id).get('name', run_id)}",
+                    )
+                    st.session_state["selected_run_id"] = selected_run_id
+                    selected_run = get_worktree_run(selected_run_id)
+
+                    if selected_run:
+                        info_left, info_right = st.columns(2)
+                        with info_left:
+                            st.markdown(f"**Run-ID:** `{selected_run.get('run_id', '-')}`")
+                            st.markdown(f"**Name:** `{selected_run.get('name', '-')}`")
+                            st.markdown(f"**Branch:** `{selected_run.get('branch', '-')}`")
+                            st.markdown(f"**Status:** `{selected_run.get('status', '-')}`")
+                        with info_right:
+                            st.markdown(f"**Erstellt:** `{selected_run.get('created_at', '-')}`")
+                            st.markdown(f"**Basis-Branch:** `{selected_run.get('base_branch', '-')}`")
+                            st.markdown(f"**Worktree:** `{selected_run.get('worktree_path', '-')}`")
+                            st.markdown(f"**Meta:** `{selected_run.get('meta_path', '-')}`")
+
+                        action_col1, action_col2, action_col3 = st.columns(3)
+                        with action_col1:
+                            if st.button("Worktree öffnen", use_container_width=True):
+                                try:
+                                    open_folder_in_explorer(Path(str(selected_run.get("worktree_path", ""))))
+                                except Exception as exc:
+                                    st.exception(exc)
+                        with action_col2:
+                            if st.button("Run-Meta öffnen", use_container_width=True):
+                                try:
+                                    open_folder_in_explorer(Path(str(selected_run.get("meta_path", ""))))
+                                except Exception as exc:
+                                    st.exception(exc)
+                        with action_col3:
+                            confirm_delete_run = st.checkbox("Run löschen bestätigen", key=f"confirm_delete_run_{selected_run_id}")
+                            if st.button("Run löschen", use_container_width=True, disabled=not confirm_delete_run):
+                                try:
+                                    remove_worktree_run(selected_run_id)
+                                    st.session_state.pop("selected_run_id", None)
+                                    st.success(f"Run gelöscht: {selected_run_id}")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.exception(exc)
+
+                        preview_tabs = st.tabs(["task.md", "review.md", "result.json", "meta.json"])
+                        preview_mapping = {
+                            "task.md": Path(str(selected_run.get("task_path", ""))),
+                            "review.md": Path(str(selected_run.get("review_path", ""))),
+                            "result.json": Path(str(selected_run.get("result_path", ""))),
+                            "meta.json": RUNS_ROOT / selected_run_id / "meta.json",
+                        }
+                        for preview_tab, file_name in zip(preview_tabs, preview_mapping.keys()):
+                            with preview_tab:
+                                preview_file = preview_mapping[file_name]
+                                if preview_file.exists() and preview_file.is_file():
+                                    try:
+                                        st.code(safe_read_preview_text(preview_file), language=file_language(preview_file))
+                                    except Exception as exc:
+                                        st.error(f"Datei konnte nicht gelesen werden: {preview_file}")
+                                        st.exception(exc)
+                                elif preview_file.exists():
+                                    st.warning(f"Pfad ist keine Datei: {preview_file}")
+                                else:
+                                    st.info("Datei nicht vorhanden.")
+                else:
+                    st.info("Noch keine Runs vorhanden.")
+
     if "profiles" in tabs_by_key:
         with tabs_by_key["profiles"]:
             st.subheader("Profile")

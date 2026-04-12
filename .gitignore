@@ -32,6 +32,8 @@ logs/
 workspace/output/
 workspace/temp/
 *.log
+workspace/runs/
+workspace/worktrees/
 
 # Optional local input data
 workspace/input/*
