@@ -1,231 +1,98 @@
-# Ollama-GUI
+# Ollama GUI
 
-Lokale Streamlit-Oberfläche für Ollama mit Profilen, Modi, Dateibrowser, Profilverwaltung und Skript-Ausführung.
+Lokale Streamlit-Oberfläche für Ollama mit Profilen, Modi, Runs und optionaler Executor-Übergabe für strukturierte Prompt-Verarbeitung.
 
-Das Projekt ist darauf ausgelegt, Prompts nicht nur direkt an ein Modell zu schicken, sondern sie abhängig vom gewählten **Profil** und **Modus** gezielt zu verarbeiten. Der Schwerpunkt liegt aktuell auf einer lokal laufenden GUI für **Code**, **Debugging**, **Refactoring** und frei definierbare eigene Profile.
+## Überblick
 
----
+Die GUI verarbeitet Eingaben nicht nur direkt in einem Schritt, sondern abhängig von **Profil** und **Modus** gezielt weiter. Der Fokus liegt auf lokaler Nutzung für:
 
-## Zweck
+- Code erzeugen
+- Code debuggen
+- Code refactoren
+- eigene Profile und Prompt-Sets
 
-Die GUI soll drei Dinge sauber zusammenbringen:
+Zusätzlich können Ergebnisse in **Runs** organisiert und bei Bedarf an externe Executor wie **Codex CLI** oder **Claude Code via Ollama** übergeben werden.
 
-1. **lokale Modellnutzung über Ollama**
-2. **steuerbare Prompt-Profile und Verarbeitungsmodi**
-3. **praktische Arbeitsoberfläche** zum Erzeugen, Prüfen, Speichern und Verwalten von Dateien
+## Kernfunktionen
 
-Damit lässt sich dieselbe Oberfläche sowohl für einfache One-shot-Anfragen als auch für mehrstufige Prompt-Pipelines nutzen.
+- lokale Modellnutzung über Ollama
+- Modellliste laden und aktualisieren
+- Modell im Hintergrund vorladen
+- Keep-Alive-Auswahl
+- Standardprofile und frei anlegbare eigene Profile
+- Standard- und erweiterter UI-Modus
+- Dateibrowser und Skript-Ausführung in der GUI
+- automatische Prüfung und einmalige Verbesserung des Ergebnisses
+- Runs mit Meta-Dateien und Arbeitsordnern
+- optionales Executor-Handoff für Codex CLI oder Claude Code via Ollama
 
----
+## Modi
 
-## Funktionen
+- **3-Stufen Pipeline**  
+  Analyse → Präzisierung → Ergebnis
 
-### Modellnutzung
-- lokale Nutzung von Ollama über `http://localhost:11434`
-- verfügbare Modelle direkt aus Ollama laden
-- Modell vorab im Hintergrund laden
-- Modellliste aktualisieren
-- Keep-Alive-Auswahl über Dropdown
+- **Step by Step Force**  
+  stärker geführte, mehrstufige Verarbeitung
 
-### Profile
-- Standardprofile:
-  - `Code erzeugen`
-  - `Code debuggen`
-  - `Code refactoren`
-- eigene Profile über die Oberfläche anlegen
-- eigene Profile löschen
-- Profilnamen getrennt von technischen Ordnernamen verwalten
-- Profile können unterschiedliche Prompt-Sets je Modus besitzen
+- **Queue**  
+  zerlegt lange Aufgaben in einzelne Schritte und arbeitet sie nacheinander ab
 
-### Modi
-- **3-Stufen Pipeline**
-  - Analyse → Präzisierung → Ergebnis
-- **One-shot**
-  - direkte Verarbeitung in einem Schritt
-- **Step by Step Force**
-  - mehrstufige, stärker geführte Verarbeitung
+- **One-shot**  
+  direkte Verarbeitung in einem Schritt
 
-### Oberfläche
-- **Standard-Modus** für reduzierten Ablauf
-- **Erweiterter Modus** für Verwaltung, Dateien und Diagnose
-- Ergebnisbereich mit Modell, Modus, Tokenzahlen und Dauer
-- Output direkt speichern, herunterladen oder Output-Ordner öffnen
+## Runs
 
-### Dateien und Skripte
-- Dateibrowser für Prompt-Dateien, Workspace und Skripte
-- neue Dateien direkt in der GUI erstellen
-- auswählbare **oder frei eingebbare** Dateiendungen
-- Skripte direkt aus der GUI starten
+Es gibt zwei grundlegende Arten von Läufen:
 
----
+- **Repo-Run**  
+  arbeitet mit Git-Worktree für bestehende Projekte
+
+- **Scratch-Run**  
+  arbeitet in einem separaten Projektordner für neue kleine Projekte oder Prototypen
+
+Damit kann die GUI sowohl bestehende Repositories bearbeiten als auch neue kleine Projekte von null erzeugen.
 
 ## Voraussetzungen
 
-- **Python 3.11+**
-- **Ollama** lokal installiert
-- mindestens ein lokal verfügbares Modell, zum Beispiel:
+- Python 3.11+
+- Ollama lokal installiert
+- mindestens ein verfügbares Modell, zum Beispiel:
   - `llama3.2`
   - `qwen2.5-coder:14b`
 
-Beispiel:
+Optional für externe Executor:
 
-```bash
-ollama pull qwen2.5-coder:14b
-```
-
----
+- **Codex CLI**
+- oder **Ollama CLI** für Claude Code via Ollama
 
 ## Installation
-
-### 1. Repository klonen
 
 ```bash
 git clone https://github.com/Pascal-64/Ollama-GUI.git
 cd Ollama-GUI
-```
-
-### 2. Abhängigkeiten installieren
-
-```bash
 pip install -r requirements.txt
-```
-
-### 3. GUI starten
-
-```bash
 streamlit run app.py
 ```
 
-Alternativ unter Windows über eine vorhandene Startdatei wie `start_gui.bat`, falls sie im Projekt enthalten ist.
-
----
+Unter Windows kann alternativ eine vorhandene Startdatei wie `start_gui.bat` genutzt werden.
 
 ## Typischer Ablauf
 
-1. Ollama starten oder über die GUI prüfen, ob die API erreichbar ist.
-2. Modell auswählen.
-3. Profil wählen.
-4. Modus wählen.
-5. Prompt eingeben.
-6. Ergebnis erzeugen.
-7. Output speichern, herunterladen oder im Output-Ordner öffnen.
+1. Ollama starten
+2. Modell auswählen
+3. Profil wählen
+4. Modus wählen
+5. Prompt eingeben
+6. Ergebnis erzeugen
+7. optional prüfen, verbessern, speichern oder an einen Executor übergeben
 
----
+## Hinweise
 
-## Projektstruktur
-
-Eine typische Struktur sieht so aus:
-
-```text
-Ollama-GUI/
-├─ app.py
-├─ requirements.txt
-├─ README.md
-├─ .gitignore
-├─ .streamlit/
-├─ config/
-│  ├─ ui_settings.json
-│  └─ profile_labels.json
-├─ prompts/
-│  └─ profiles/
-│     ├─ code_generate/
-│     │  ├─ pipeline/
-│     │  ├─ oneshot/
-│     │  └─ step_by_step_force/
-│     ├─ code_debug/
-│     │  ├─ pipeline/
-│     │  ├─ oneshot/
-│     │  └─ step_by_step_force/
-│     ├─ code_refactor/
-│     │  ├─ pipeline/
-│     │  ├─ oneshot/
-│     │  └─ step_by_step_force/
-│     └─ <eigene_profile>/
-├─ scripts/
-├─ workspace/
-│  ├─ input/
-│  ├─ output/
-│  └─ temp/
-└─ logs/
-```
-
----
-
-## Wie Profile funktionieren
-
-Ein Profil ist technisch ein eigener Ordner unter:
-
-```text
-prompts/profiles/<profilname>/
-```
-
-Darin liegen die Prompt-Dateien für die unterstützten Modi.
-
-Beispiel:
-
-```text
-prompts/profiles/code_generate/
-├─ pipeline/
-│  ├─ 01_analyse.txt
-│  ├─ 02_loesung.txt
-│  └─ 03_code.txt
-├─ oneshot/
-│  └─ 01_code_only.txt
-└─ step_by_step_force/
-   ├─ 01_analyse.txt
-   ├─ 02_loesung.txt
-   └─ 03_code.txt
-```
-
-Eigene Profile können über die Oberfläche erstellt und anschließend direkt im Dateibrowser bearbeitet werden.
-
----
-
-## Hinweise zu Dateiendungen
-
-An zwei Stellen können Dateien gespeichert oder erzeugt werden:
-
-1. **Output-Datei im Code-Tab**
-2. **Neue Datei im Dateien-Tab**
-
-Beide Bereiche unterstützen:
-- feste Endungen per Dropdown
-- eigene freie Endungen per Eingabe
-
-Beispiele:
-- `test` + `.py` → `test.py`
-- `config` + `ini` → `config.ini`
-- `prompt` + `.myext` → `prompt.myext`
-
----
-
-## Hinweise zu GitHub
-
-Das Projekt kann direkt mit **GitHub Desktop** verwaltet werden. Für lokale Entwicklung ist das völlig ausreichend.
-
-Sinnvoll ist dabei:
-- Quellcode, Prompt-Dateien und Konfiguration versionieren
-- Laufzeitdaten und Output-Dateien per `.gitignore` ausschließen
-
-Typisch nicht committen:
-- `__pycache__/`
-- `.venv/`
-- `logs/`
-- `workspace/output/`
-- `workspace/temp/`
-
----
-
-## Nächste sinnvolle Ausbaustufen
-
-- profilabhängige Button-Texte wie „Code erzeugen“ oder „Erklärung erzeugen“
-- Import/Export für Profile
-- bessere Vorschau für Ergebnis-Dateitypen
-- klarere Trennung zwischen Code-, Erklär- und Analyse-Profilen
-- optionale Vorlagen für neue Profile
-
----
+- Profile besitzen eigene Prompt-Dateien je Modus.
+- Dateiendungen können per Dropdown gewählt oder frei eingegeben werden.
+- Repo-Runs können Projektänderungen später per Git sauber zurück in den Basis-Branch übernehmen.
+- Scratch-Runs sind für neue Mini-Projekte gedacht und haben keine Git-Übernahme in den Hauptstand.
 
 ## Status
 
-Das Projekt ist funktional, aber weiterhin im Ausbau. Die Oberfläche und die Prompt-Profile werden iterativ erweitert.
+Das Projekt ist funktionsfähig und wird laufend erweitert.
